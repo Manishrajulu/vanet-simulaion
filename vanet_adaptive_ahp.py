@@ -2,6 +2,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 import math
 import numpy as np
+import random
 
 # STEP 1 — Extract Mobility Data
 
@@ -18,6 +19,9 @@ for timestep in root.findall("timestep"):
         y = float(vehicle.attrib["y"])
         speed = float(vehicle.attrib["speed"])
         angle = float(vehicle.attrib.get("angle", 0.0))
+        
+
+        
         vehicle_data[time][vid] = (x, y, speed, angle)
 
 print("Mobility data extracted.")
@@ -38,7 +42,7 @@ def distance(x1, y1, x2, y2):
 
 # STEP 3 — Communication Parameters
 
-COMM_RANGE = 250
+COMM_RANGE = 300
 DIRECTION_THRESHOLD = 60
 TX_POWER = 0.1
 NOISE = 1e-9
@@ -67,6 +71,15 @@ INITIAL_ENERGY = 100.0
 NORMAL_ENERGY_LOSS = 0.05
 CH_ENERGY_LOSS = 0.15
 
+# Accident Detection Infrastructure
+previous_speed = {}  # vid -> previous speed
+stopped_duration = {}  # vid -> count of consecutive stopped timesteps
+event_list = []  # list of accident events
+reported_accidents = set()  # vid -> reported status (to prevent duplicates)
+ACCIDENT_SPEED_THRESHOLD = 5   # m/s - previous speed must exceed this
+ACCIDENT_STOPPED_SPEED = 1     # m/s - current speed must be below this
+ACCIDENT_STOPPED_MIN = 3       # minimum consecutive timesteps stopped to declare accident
+
 # Evaluation Metrics
 active_clusters = {} # cluster_key -> start_time
 cluster_lifetimes = []
@@ -74,6 +87,10 @@ ch_tracking = {} # cluster_key -> current_ch
 total_ch_changes = 0
 all_cluster_sizes = []
 previous_ccs = set() # To track which cluster keys were present in the previous timestep
+
+# Task Management
+generated_tasks = []  # All tasks generated in current timestep
+cluster_task_queue = {}  # CH -> list of tasks
 
 def get_clusters(vehicles):
     """Group vehicles into clusters based on COMM_RANGE."""
@@ -141,6 +158,64 @@ def normalize_safe(values):
         return [0.5] * len(values)
     return [(v - v_min) / (v_max - v_min) for v in values]
 
+def detect_accidents(vehicles, time, time_idx):
+    """Detect accidents based on sudden speed drop + persistent stopping."""
+    detected_accidents = []
+
+    for vid, (x, y, speed, angle) in vehicles.items():
+        prev_speed = previous_speed.get(vid, speed)
+
+        # --- STEP 1: Relaxed speed-drop condition ---
+        if prev_speed > ACCIDENT_SPEED_THRESHOLD and speed < ACCIDENT_STOPPED_SPEED:
+            stopped_duration[vid] = stopped_duration.get(vid, 0) + 1
+        elif speed < ACCIDENT_STOPPED_SPEED:
+            # Still stopped but no preceding fast speed — keep counting
+            stopped_duration[vid] = stopped_duration.get(vid, 0) + 1
+        else:
+            stopped_duration[vid] = 0
+
+        # --- STEP 3: Debug logging for first 50 timesteps ---
+        if time_idx < 50:
+            print(f"  DEBUG Vehicle {vid}: prev={prev_speed:.2f}, "
+                  f"curr={speed:.2f}, stopped={stopped_duration.get(vid, 0)}")
+
+        # Update previous speed
+        previous_speed[vid] = speed
+
+        # --- STEP 2: Only speed-drop + stopped-duration (no neighbor condition) ---
+        if stopped_duration.get(vid, 0) >= ACCIDENT_STOPPED_MIN:
+            if vid not in reported_accidents:
+                print(f"\n=== ACCIDENT DETECTED ===")
+                print(f"Vehicle {vid} stopped for {stopped_duration[vid]} timesteps")
+                accident_event = {
+                    "type": "accident",
+                    "vehicle_id": vid,
+                    "location": (x, y),
+                    "time": time,
+                    "speed": speed,
+                    "stopped_duration": stopped_duration[vid]
+                }
+                detected_accidents.append(accident_event)
+                # --- STEP 4: Create accident task with priority 1 ---
+                accident_task = create_task("accident", vid, (x, y), time, 1)
+                generated_tasks.append(accident_task)
+                print(f"Task assigned: accident from Vehicle {vid}")
+                print(f"ACCIDENT DETECTED by Vehicle {vid}")
+                reported_accidents.add(vid)
+
+    return detected_accidents
+
+def create_task(task_type, vehicle_id, location, time, priority):
+    """Create a task dictionary."""
+    task = {
+        "type": task_type,
+        "vehicle_id": vehicle_id,
+        "location": location,
+        "time": time,
+        "priority": priority
+    }
+    return task
+
 print("\nStarting Improved Adaptive AHP Cluster Head Selection...\n")
 
 for time_idx, time in enumerate(v_times):
@@ -150,6 +225,33 @@ for time_idx, time in enumerate(v_times):
     for vid in vehicles:
         if vid not in vehicle_energy:
             vehicle_energy[vid] = INITIAL_ENERGY
+    
+    # --- STEP 6: Forced test — simulate vehicle "12" stopping at timesteps 40-45 ---
+    if "12" in vehicles and 40 <= time_idx <= 45:
+        x12, y12, s12, a12 = vehicles["12"]
+        vehicles["12"] = (x12, y12, 0.0, a12)  # force speed to 0
+
+    # Accident Detection
+    detected_accidents = detect_accidents(vehicles, time, time_idx)
+
+    # Traffic Task Generation (20% probability per vehicle)
+    for vid in vehicles:
+        if random.random() < 0.2:
+            x, y, speed, angle = vehicles[vid]
+            traffic_task = create_task("traffic", vid, (x, y), time, 2)
+            generated_tasks.append(traffic_task)
+            if time_idx < 50:
+                print(f"Traffic task generated for Vehicle {vid}")
+    
+    # Log detected accidents (limit to first 50 timesteps for readability)
+    if time_idx < 50 and detected_accidents:
+        print(f"\n=== ACCIDENT DETECTED at Time {time} ===")
+        for accident in detected_accidents:
+            vid = accident["vehicle_id"]
+            x, y = accident["location"]
+            print(f"Accident detected by Vehicle {vid}")
+            print(f"Location: ({x:.1f}, {y:.1f})")
+            print(f"Stopped for {accident['stopped_duration']} timesteps")
     
     # Cluster Formation
     clusters = get_clusters(vehicles)
@@ -223,6 +325,10 @@ for time_idx, time in enumerate(v_times):
         ch_index = np.argmax(scores)
         ch_vid = voting_pool[ch_index]
         timestep_chs.add(ch_vid)
+
+        # Initialize task queue for this cluster head if not exists
+        if ch_vid not in cluster_task_queue:
+            cluster_task_queue[ch_vid] = []
         
         # CH Stability Tracking
         if cluster_key in ch_tracking:
@@ -242,6 +348,50 @@ for time_idx, time in enumerate(v_times):
                 print(f"    Vehicle {vid} -> {scores[k]:.4f}")
             print(f"  Cluster Head: Vehicle {ch_vid}")
             print(f"  Remaining Energy: {vehicle_energy[ch_vid]:.2f}\n")
+        
+        # Task Assignment to Cluster Head
+        # Assign tasks from this cluster to the cluster head
+        for task in generated_tasks:
+            task_vid = task["vehicle_id"]
+            if task_vid in cluster:
+                cluster_task_queue[ch_vid].append(task)
+                if time_idx < 50:
+                    print(f"  Task assigned: {task['type']} from Vehicle {task_vid} to CH {ch_vid}")
+
+        # Priority Scheduling and Task Processing
+        if cluster_task_queue[ch_vid]:
+            # Sort tasks by priority (1=accident first, then by time)
+            cluster_task_queue[ch_vid].sort(key=lambda t: (t["priority"], t["time"]))
+
+            if time_idx < 50:
+                print(f"  Cluster Head {ch_vid} received {len(cluster_task_queue[ch_vid])} tasks")
+                print(f"  Queue order (priority, time): {[(t['priority'], t['time']) for t in cluster_task_queue[ch_vid]]}")
+
+            # Process tasks in sorted order
+            for task in cluster_task_queue[ch_vid]:
+                task_vid = task["vehicle_id"]
+                task_type = task["type"]
+
+                if time_idx < 50:
+                    print(f"  Processing {task_type} from Vehicle {task_vid}")
+                    if task_type == "accident":
+                        print("  >>> HIGH PRIORITY ALERT <<<")
+
+                # Determine communication path
+                task_x, task_y = task["location"]
+                nearest_rsu = min(RSUs, key=lambda rsu: distance(task_x, task_y, rsu["x"], rsu["y"]))
+
+                if len(cluster) == 1 or task_vid == ch_vid:
+                    # Isolated vehicle or CH is task source - direct to RSU
+                    if time_idx < 50:
+                        print(f"  Vehicle {task_vid} -> {nearest_rsu['id']}")
+                else:
+                    # Via Cluster Head
+                    if time_idx < 50:
+                        print(f"  Vehicle {task_vid} -> CH {ch_vid} -> {nearest_rsu['id']}")
+
+            # Clear task queue after processing
+            cluster_task_queue[ch_vid].clear()
 
     # Cleanup finished clusters and calculate lifetime
     for deleted_ck in (previous_ccs - current_cluster_keys):
@@ -252,6 +402,9 @@ for time_idx, time in enumerate(v_times):
             del ch_tracking[deleted_ck]
             
     previous_ccs = current_cluster_keys
+
+    # Clear generated tasks for next timestep
+    generated_tasks = []
 
     # Energy Loss Update (apply to all vehicles present)
     for vid in vehicles:
