@@ -47,6 +47,8 @@ DIRECTION_THRESHOLD = 60
 TX_POWER = 0.1
 NOISE = 1e-9
 PATH_LOSS_EXP = 3
+DEADLINE = 5
+TASK_LOAD = 1.0 # 0.5=Low, 1.0=Normal, 1.5=High, 2.0=Very High
 
 def channel_gain(d):
     if d == 0:
@@ -76,9 +78,15 @@ previous_speed = {}  # vid -> previous speed
 stopped_duration = {}  # vid -> count of consecutive stopped timesteps
 event_list = []  # list of accident events
 reported_accidents = set()  # vid -> reported status (to prevent duplicates)
-ACCIDENT_SPEED_THRESHOLD = 5   # m/s - previous speed must exceed this
-ACCIDENT_STOPPED_SPEED = 1     # m/s - current speed must be below this
-ACCIDENT_STOPPED_MIN = 3       # minimum consecutive timesteps stopped to declare accident
+# Simplified thresholds for hybrid model
+ACCIDENT_SPEED_THRESHOLD = 8       # Must be moving fast for Path 1
+ACCIDENT_DECEL_THRESHOLD = 6       # Deceleration > 6 for Path 1
+ACCIDENT_STOPPED_SPEED = 1         # Speed < 1 for Path 2
+ACCIDENT_STOPPED_MIN = 4           # Increased to 4 timesteps for Path 2 (reduces false positives)
+ACCIDENT_IMMEDIATE_THRESHOLD = 2    # Speed < 2 for Path 1 immediate detection
+ACCIDENT_PREV_SPEED_MIN = 5       # Prev speed > 5 for Path 2 (ensures vehicle was moving)
+ACCIDENT_NEIGHBOR_RADIUS = 100     # 100m radius to check neighbors
+ACCIDENT_NEIGHBOR_SPEED = 5        # Neighbor avg speed < 5 m/s indicates slowdown
 
 # Evaluation Metrics
 active_clusters = {} # cluster_key -> start_time
@@ -159,48 +167,72 @@ def normalize_safe(values):
     return [(v - v_min) / (v_max - v_min) for v in values]
 
 def detect_accidents(vehicles, time, time_idx):
-    """Detect accidents based on sudden speed drop + persistent stopping."""
+    """Detect accidents using hybrid model (immediate + persistent)."""
     detected_accidents = []
 
     for vid, (x, y, speed, angle) in vehicles.items():
         prev_speed = previous_speed.get(vid, speed)
+        speed_drop = prev_speed - speed
 
-        # --- STEP 1: Relaxed speed-drop condition ---
-        if prev_speed > ACCIDENT_SPEED_THRESHOLD and speed < ACCIDENT_STOPPED_SPEED:
+        # Track stopped duration (for Path 2) - only if vehicle was moving before
+        if prev_speed > ACCIDENT_PREV_SPEED_MIN and speed < ACCIDENT_STOPPED_SPEED:
             stopped_duration[vid] = stopped_duration.get(vid, 0) + 1
-        elif speed < ACCIDENT_STOPPED_SPEED:
-            # Still stopped but no preceding fast speed — keep counting
-            stopped_duration[vid] = stopped_duration.get(vid, 0) + 1
-        else:
+        elif speed >= ACCIDENT_STOPPED_SPEED:
             stopped_duration[vid] = 0
-
-        # --- STEP 3: Debug logging for first 50 timesteps ---
-        if time_idx < 50:
-            print(f"  DEBUG Vehicle {vid}: prev={prev_speed:.2f}, "
-                  f"curr={speed:.2f}, stopped={stopped_duration.get(vid, 0)}")
 
         # Update previous speed
         previous_speed[vid] = speed
 
-        # --- STEP 2: Only speed-drop + stopped-duration (no neighbor condition) ---
+        # PATH 1: Immediate detection (sudden deceleration) - UNCHANGED
+        accident_detected = False
+        detection_path = "UNKNOWN"
+
+        # Check PATH 1 independently
+        if (prev_speed > ACCIDENT_SPEED_THRESHOLD and
+            speed_drop > ACCIDENT_DECEL_THRESHOLD and
+            speed < ACCIDENT_IMMEDIATE_THRESHOLD):
+            accident_detected = True
+            detection_path = "IMMEDIATE"
+
+        # Check PATH 2 independently (not elif - both paths can trigger)
         if stopped_duration.get(vid, 0) >= ACCIDENT_STOPPED_MIN:
+            accident_detected = True
+            detection_path = "PERSISTENT"
+
+        # Debug logging for potential accidents (first 50 timesteps)
+        if time_idx < 50 and speed_drop > 4:
+            print(f"  POTENTIAL Vehicle {vid}: prev={prev_speed:.1f}, "
+                  f"curr={speed:.1f}, drop={speed_drop:.1f}, "
+                  f"stopped={stopped_duration.get(vid, 0)}")
+
+        # If accident detected
+        if accident_detected:
             if vid not in reported_accidents:
-                print(f"\n=== ACCIDENT DETECTED ===")
-                print(f"Vehicle {vid} stopped for {stopped_duration[vid]} timesteps")
+                # Full debug logging (first 50 timesteps)
+                if time < 50:
+                    print(f"\n  === ACCIDENT DETECTED ({detection_path}) ===")
+                    print(f"  Vehicle {vid}:")
+                    print(f"  prev_speed={prev_speed:.1f}, curr_speed={speed:.1f}")
+                    print(f"  speed_drop={speed_drop:.1f}, stopped={stopped_duration.get(vid, 0)}")
+
+                print(f"\n=== ACCIDENT DETECTED at Time {time} ===")
+                print(f"Vehicle {vid} stopped for {stopped_duration.get(vid, 0)} timesteps ({detection_path})")
+
+                # Create task with priority 1
+                accident_task = create_task("accident", vid, (x, y), time, 1)
+                generated_tasks.append(accident_task)
+
                 accident_event = {
                     "type": "accident",
                     "vehicle_id": vid,
                     "location": (x, y),
                     "time": time,
                     "speed": speed,
-                    "stopped_duration": stopped_duration[vid]
+                    "stopped_duration": stopped_duration.get(vid, 0),
+                    "detection_path": detection_path
                 }
                 detected_accidents.append(accident_event)
-                # --- STEP 4: Create accident task with priority 1 ---
-                accident_task = create_task("accident", vid, (x, y), time, 1)
-                generated_tasks.append(accident_task)
-                print(f"Task assigned: accident from Vehicle {vid}")
-                print(f"ACCIDENT DETECTED by Vehicle {vid}")
+                event_list.append(accident_event)
                 reported_accidents.add(vid)
 
     return detected_accidents
@@ -218,6 +250,11 @@ def create_task(task_type, vehicle_id, location, time, priority):
 
 print("\nStarting Improved Adaptive AHP Cluster Head Selection...\n")
 
+# Initialize Performance Metrics
+total_delay = 0
+total_tasks = 0
+successful_tasks = 0
+
 for time_idx, time in enumerate(v_times):
     vehicles = vehicle_data[time]
     
@@ -234,9 +271,9 @@ for time_idx, time in enumerate(v_times):
     # Accident Detection
     detected_accidents = detect_accidents(vehicles, time, time_idx)
 
-    # Traffic Task Generation (20% probability per vehicle)
+    # Traffic Task Generation (20% probability * TASK_LOAD per vehicle)
     for vid in vehicles:
-        if random.random() < 0.2:
+        if random.random() < (0.2 * TASK_LOAD):
             x, y, speed, angle = vehicles[vid]
             traffic_task = create_task("traffic", vid, (x, y), time, 2)
             generated_tasks.append(traffic_task)
@@ -363,17 +400,30 @@ for time_idx, time in enumerate(v_times):
             # Sort tasks by priority (1=accident first, then by time)
             cluster_task_queue[ch_vid].sort(key=lambda t: (t["priority"], t["time"]))
 
+            # --- Refined Delay Calculation ---
+            queue_size = len(cluster_task_queue[ch_vid])
+            processing_delay = queue_size * 0.5
+
             if time_idx < 50:
-                print(f"  Cluster Head {ch_vid} received {len(cluster_task_queue[ch_vid])} tasks")
-                print(f"  Queue order (priority, time): {[(t['priority'], t['time']) for t in cluster_task_queue[ch_vid]]}")
+                print(f"  Cluster Head {ch_vid} received {queue_size} tasks")
+                print(f"  Processing Delay: {processing_delay:.2f}s")
 
             # Process tasks in sorted order
             for task in cluster_task_queue[ch_vid]:
                 task_vid = task["vehicle_id"]
                 task_type = task["type"]
 
+                # --- Metrics Calculation ---
+                network_delay = random.uniform(0.5, 1.5)
+                delay = processing_delay + network_delay
+                
+                total_delay += delay
+                total_tasks += 1
+                if delay <= DEADLINE:
+                    successful_tasks += 1
+
                 if time_idx < 50:
-                    print(f"  Processing {task_type} from Vehicle {task_vid}")
+                    print(f"  Processing {task_type} (Delay: {delay:.2f}s)")
                     if task_type == "accident":
                         print("  >>> HIGH PRIORITY ALERT <<<")
 
@@ -432,3 +482,17 @@ print(f"Average Cluster Lifetime: {avg_lifetime:.1f} seconds")
 print(f"Cluster Head Changes: {total_ch_changes}")
 print(f"Average Remaining Energy: {avg_energy:.1f}")
 print("--------------------------------------------------")
+
+# Final Performance Metrics Computation
+if total_tasks > 0:
+    avg_delay = total_delay / total_tasks
+    success_rate = (successful_tasks / total_tasks) * 100
+else:
+    avg_delay = 0
+    success_rate = 0
+
+print("\n=== PERFORMANCE METRICS ===")
+print("Total Tasks:", total_tasks)
+print("Average Delay:", round(avg_delay, 2))
+print("Success Rate:", round(success_rate, 2), "%")
+print("===========================\n")
